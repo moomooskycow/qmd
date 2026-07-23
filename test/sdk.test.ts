@@ -185,14 +185,54 @@ describe("createStore", () => {
       return [];
     }) as typeof store.internal.expandQuery;
 
-    await store.search({ queries: [{ type: "lex", query: "session" }] });
+    await store.search({ queries: [{ type: "lex", query: "session" }], rerank: false });
     await store.searchVector("session");
     await store.expandQuery("session");
 
-    expect(observed).toEqual([false, false, false]);
+    expect(observed).toEqual([true, false, false]);
     expect(searchVectorUsedSession).toBe(true);
     expect(canUnloadLLM(llm)).toBe(true);
     await store.close();
+  });
+
+  test("does not wait for an idle unload during pure lex search", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+      inactivityTimeoutMs: 10,
+    });
+    const llm = store.internal.llm!;
+    let releaseIdleUnload: () => void = () => {};
+    const idleUnload = new Promise<void>((resolve) => {
+      releaseIdleUnload = resolve;
+    });
+    (llm as unknown as { idleUnloadPromise: Promise<void> | null }).idleUnloadPromise = idleUnload;
+
+    let lexStarted = false;
+    store.internal.searchFTS = (() => {
+      lexStarted = true;
+      expect(canUnloadLLM(llm)).toBe(true);
+      return [];
+    }) as typeof store.internal.searchFTS;
+
+    let completed = false;
+    const search = store.search({
+      queries: [{ type: "lex", query: "idle" }],
+      rerank: false,
+    }).then(() => {
+      completed = true;
+    });
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(lexStarted).toBe(true);
+      expect(completed).toBe(true);
+    } finally {
+      releaseIdleUnload();
+      (llm as unknown as { idleUnloadPromise: Promise<void> | null }).idleUnloadPromise = null;
+      await search;
+      await store.close();
+    }
   });
 
 });

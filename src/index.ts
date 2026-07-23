@@ -391,21 +391,35 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     dbPath: internal.dbPath,
 
     // Search
-    search: async (opts) => withLLMSessionForLlm(llm, async () => {
-      if (!opts.query && !opts.queries) {
-        throw new Error("search() requires either 'query' or 'queries'");
-      }
-      // Normalize collection/collections
-      const collections = [
-        ...(opts.collection ? [opts.collection] : []),
-        ...(opts.collections ?? []),
-      ];
-      const skipRerank = opts.rerank === false;
+    search: async (opts) => {
+      const runSearch = async () => {
+        if (!opts.query && !opts.queries) {
+          throw new Error("search() requires either 'query' or 'queries'");
+        }
+        // Normalize collection/collections
+        const collections = [
+          ...(opts.collection ? [opts.collection] : []),
+          ...(opts.collections ?? []),
+        ];
+        const skipRerank = opts.rerank === false;
 
-      if (opts.queries) {
-        // Pre-expanded queries — use structuredSearch
-        return structuredSearch(internal, opts.queries, {
-          collections: collections.length > 0 ? collections : undefined,
+        if (opts.queries) {
+          // Pre-expanded queries — use structuredSearch
+          return structuredSearch(internal, opts.queries, {
+            collections: collections.length > 0 ? collections : undefined,
+            limit: opts.limit,
+            minScore: opts.minScore,
+            explain: opts.explain,
+            intent: opts.intent,
+            candidateLimit: opts.candidateLimit,
+            skipRerank,
+            chunkStrategy: opts.chunkStrategy,
+          });
+        }
+
+        // Simple query string — use hybridQuery (expand + search + rerank)
+        return hybridQuery(internal, opts.query!, {
+          collection: collections[0],
           limit: opts.limit,
           minScore: opts.minScore,
           explain: opts.explain,
@@ -414,20 +428,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
         });
-      }
+      };
 
-      // Simple query string — use hybridQuery (expand + search + rerank)
-      return hybridQuery(internal, opts.query!, {
-        collection: collections[0],
-        limit: opts.limit,
-        minScore: opts.minScore,
-        explain: opts.explain,
-        intent: opts.intent,
-        candidateLimit: opts.candidateLimit,
-        skipRerank,
-        chunkStrategy: opts.chunkStrategy,
-      });
-    }),
+      // Typed lex queries with reranking disabled are pure BM25 and do not
+      // need a session, so they stay available while LLM resources unload.
+      const isPureLex = opts.rerank === false
+        && !!opts.queries
+        && opts.queries.length > 0
+        && opts.queries.every((query) => query.type === "lex");
+      return isPureLex ? runSearch() : withLLMSessionForLlm(llm, runSearch);
+    },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
     searchVector: async (q, opts) => withLLMSessionForLlm(
       llm,
