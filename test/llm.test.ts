@@ -17,11 +17,13 @@ import {
   withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
   resolveSafeParallelism,
+  resolveInactivityTimeoutMs,
   resolveEmbedModel,
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
   withLLMSession,
+  withLLMSessionForLlm,
   canUnloadLLM,
   SessionReleasedError,
   type RerankDocument,
@@ -82,6 +84,88 @@ describe("model name resolution", () => {
       expect(llm.generateModelName).toBe(resolveGenerateModel({ generate: "config-generate" }));
       expect(llm.rerankModelName).toBe(resolveRerankModel({ rerank: "config-rerank" }));
     });
+  });
+});
+
+describe("inactivity timeout resolution", () => {
+  test("uses explicit configuration before the environment", () => {
+    expect(resolveInactivityTimeoutMs(1_000, "2500")).toBe(1_000);
+  });
+
+  test("accepts zero to disable unloading and positive environment values", () => {
+    expect(resolveInactivityTimeoutMs(undefined, "0")).toBe(0);
+    expect(resolveInactivityTimeoutMs(undefined, "30000")).toBe(30_000);
+  });
+
+  test("warns and uses five minutes for an invalid environment value", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      expect(resolveInactivityTimeoutMs(undefined, "later")).toBe(5 * 60 * 1_000);
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_INACTIVITY_TIMEOUT_MS");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  test("rejects invalid explicit configuration", () => {
+    expect(() => resolveInactivityTimeoutMs(-1)).toThrow("inactivityTimeoutMs");
+    expect(() => resolveInactivityTimeoutMs(1.5)).toThrow("inactivityTimeoutMs");
+  });
+});
+
+describe("per-instance LLM session management", () => {
+  test("tracks overlapping sessions for the exact LlamaCpp instance", async () => {
+    const first = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    const second = new LlamaCpp({ inactivityTimeoutMs: 0 });
+
+    expect(canUnloadLLM(first)).toBe(true);
+    await withLLMSessionForLlm(first, async () => {
+      expect(canUnloadLLM(first)).toBe(false);
+      expect(canUnloadLLM(second)).toBe(true);
+
+      await withLLMSessionForLlm(first, async () => {
+        expect(canUnloadLLM(first)).toBe(false);
+      });
+
+      expect(canUnloadLLM(first)).toBe(false);
+    });
+    expect(canUnloadLLM(first)).toBe(true);
+
+    await first.dispose();
+    await second.dispose();
+  });
+
+  test("operations wait for an idle unload already in progress", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
+    let releaseDispose: () => void = () => {};
+    const disposeGate = new Promise<void>((resolve) => {
+      releaseDispose = resolve;
+    });
+    let disposeStarted = false;
+    let operationStarted = false;
+    const internals = llm as unknown as {
+      embedContexts: Array<{ dispose(): Promise<void> }>;
+    };
+    internals.embedContexts = [{
+      dispose: async () => {
+        disposeStarted = true;
+        await disposeGate;
+      },
+    }];
+
+    const unload = llm.unloadIdleResources();
+    expect(disposeStarted).toBe(true);
+
+    const operation = withLLMSessionForLlm(llm, async () => {
+      operationStarted = true;
+    });
+    await Promise.resolve();
+    expect(operationStarted).toBe(false);
+
+    releaseDispose();
+    await Promise.all([unload, operation]);
+    expect(operationStarted).toBe(true);
+    await llm.dispose();
   });
 });
 

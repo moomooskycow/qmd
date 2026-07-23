@@ -3493,6 +3493,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
   add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
+  add("QMD_INACTIVITY_TIMEOUT_MS", "sets milliseconds before idle LLM contexts and models unload; lower values reclaim MCP memory sooner, 0 disables idle unloading");
   add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
   add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");

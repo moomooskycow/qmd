@@ -67,6 +67,7 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  withLLMSessionForLlm,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -209,6 +210,8 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** Idle time before unloading LLM contexts and models (default: 5 minutes; env: QMD_INACTIVITY_TIMEOUT_MS) */
+  inactivityTimeoutMs?: number;
 }
 
 /**
@@ -372,13 +375,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
+  // Create a per-store LlamaCpp instance. The timeout can be shortened for
+  // memory-sensitive daemons; an instance session prevents mid-query unload.
   const llm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
+    inactivityTimeoutMs: options.inactivityTimeoutMs,
     disposeModelsOnInactivity: true,
   });
   internal.llm = llm;
@@ -388,7 +391,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     dbPath: internal.dbPath,
 
     // Search
-    search: async (opts) => {
+    search: async (opts) => withLLMSessionForLlm(llm, async () => {
       if (!opts.query && !opts.queries) {
         throw new Error("search() requires either 'query' or 'queries'");
       }
@@ -424,10 +427,22 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
       });
-    },
+    }),
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
-    expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
+    searchVector: async (q, opts) => withLLMSessionForLlm(
+      llm,
+      (session) => internal.searchVec(
+        q,
+        llm.embedModelName,
+        opts?.limit,
+        opts?.collection,
+        session
+      )
+    ),
+    expandQuery: async (q, opts) => withLLMSessionForLlm(
+      llm,
+      () => internal.expandQuery(q, undefined, opts?.intent)
+    ),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });

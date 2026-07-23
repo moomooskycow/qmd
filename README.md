@@ -1072,6 +1072,7 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
+| `QMD_INACTIVITY_TIMEOUT_MS` | `300000` | Unload idle LLM contexts and models after this many milliseconds. Lower this for memory-sensitive long-lived MCP/SDK processes; `0` disables idle unloading. Active store queries hold an instance-scoped lease so short timeouts cannot dispose their resources mid-request. |
 
 ## How It Works
 

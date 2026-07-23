@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- `QMD_INACTIVITY_TIMEOUT_MS` and the SDK `StoreOptions.inactivityTimeoutMs`
+  setting control when long-lived stores unload idle model resources.
+
+### Fixed
+
+- Per-store searches now hold an instance-scoped LLM lease, preventing a short
+  inactivity timeout from disposing contexts during an active MCP or SDK query.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

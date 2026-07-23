@@ -669,6 +669,7 @@ describe("CLI Status Command", () => {
       QMD_FORCE_CPU: "1",
       QMD_LLAMA_GPU: "metal",
       QMD_EMBED_PARALLELISM: "2",
+      QMD_INACTIVITY_TIMEOUT_MS: "30000",
       QMD_EXPAND_CONTEXT_SIZE: "4096",
       QMD_RERANK_CONTEXT_SIZE: "8192",
       QMD_EMBED_CONTEXT_SIZE: "1024",

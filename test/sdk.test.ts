@@ -22,7 +22,7 @@ import {
   type VectorSearchOptions,
   type ExpandQueryOptions,
 } from "../src/index.js";
-import { setDefaultLlamaCpp } from "../src/llm.js";
+import { canUnloadLLM, setDefaultLlamaCpp } from "../src/llm.js";
 
 // =============================================================================
 // Test Helpers
@@ -146,6 +146,55 @@ describe("createStore", () => {
     expect(store.dbPath).toBe(dbPath);
     await store.close();
   });
+
+  test("uses the configured model inactivity timeout", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+      inactivityTimeoutMs: 30_000,
+    });
+    const llm: unknown = store.internal.llm;
+
+    expect(llm && typeof llm === "object" && "inactivityTimeoutMs" in llm
+      ? llm.inactivityTimeoutMs
+      : undefined).toBe(30_000);
+    await store.close();
+  });
+
+  test("holds an instance session across each LLM-backed query path", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: {} },
+      inactivityTimeoutMs: 10,
+    });
+    const llm = store.internal.llm!;
+    const observed: boolean[] = [];
+    let searchVectorUsedSession = false;
+
+    store.internal.searchFTS = (() => {
+      observed.push(canUnloadLLM(llm));
+      return [];
+    }) as typeof store.internal.searchFTS;
+    store.internal.searchVec = (async (_query, _model, _limit, _collection, session) => {
+      observed.push(canUnloadLLM(llm));
+      searchVectorUsedSession = session?.isValid ?? false;
+      return [];
+    }) as typeof store.internal.searchVec;
+    store.internal.expandQuery = (async () => {
+      observed.push(canUnloadLLM(llm));
+      return [];
+    }) as typeof store.internal.expandQuery;
+
+    await store.search({ queries: [{ type: "lex", query: "session" }] });
+    await store.searchVector("session");
+    await store.expandQuery("session");
+
+    expect(observed).toEqual([false, false, false]);
+    expect(searchVectorUsedSession).toBe(true);
+    expect(canUnloadLLM(llm)).toBe(true);
+    await store.close();
+  });
+
 });
 
 // =============================================================================
@@ -952,6 +1001,7 @@ describe("embed", () => {
     const embedBatchCalls: string[][] = [];
     return {
       embedBatchCalls,
+      async waitForIdleUnload() {},
       async embed(_text: string) {
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
       },

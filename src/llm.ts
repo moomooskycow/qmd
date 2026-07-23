@@ -567,7 +567,7 @@ export type LlamaCppConfig = {
    */
   expandContextSize?: number;
   /**
-   * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
+   * Inactivity timeout in ms before unloading contexts (default: 5 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
    * contexts when idle, since contexts (and their sequences) are the heavy per-session objects.
@@ -588,6 +588,30 @@ export type LlamaCppConfig = {
  */
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+
+export function resolveInactivityTimeoutMs(
+  configValue?: number,
+  envValue = process.env.QMD_INACTIVITY_TIMEOUT_MS
+): number {
+  if (configValue !== undefined) {
+    if (!Number.isInteger(configValue) || configValue < 0) {
+      throw new Error(`Invalid inactivityTimeoutMs: ${configValue}. Must be a non-negative integer.`);
+    }
+    return configValue;
+  }
+
+  const normalized = envValue?.trim() ?? "";
+  if (!normalized) return DEFAULT_INACTIVITY_TIMEOUT_MS;
+
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_INACTIVITY_TIMEOUT_MS="${envValue}", using default ${DEFAULT_INACTIVITY_TIMEOUT_MS}.\n`
+    );
+    return DEFAULT_INACTIVITY_TIMEOUT_MS;
+  }
+  return parsed;
+}
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
 export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
@@ -717,6 +741,7 @@ export class LlamaCpp implements LLM {
 
   // Inactivity timer for auto-unloading models
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleUnloadPromise: Promise<void> | null = null;
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
 
@@ -736,7 +761,7 @@ export class LlamaCpp implements LLM {
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
-    this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
+    this.inactivityTimeoutMs = resolveInactivityTimeoutMs(config.inactivityTimeoutMs);
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
 
@@ -766,10 +791,9 @@ export class LlamaCpp implements LLM {
     // Only set timer if we have disposable contexts and timeout is enabled
     if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
       this.inactivityTimer = setTimeout(() => {
-        // Check if session manager allows unloading
-        // canUnloadLLM is defined later in this file - it checks the session manager
-        // We use dynamic import pattern to avoid circular dependency issues
-        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
+        // Idle policy is per LlamaCpp instance. A different store's session
+        // must neither block this unload nor leave this store unprotected.
+        if (!canUnloadLLM(this)) {
           // Active sessions/operations - reschedule timer
           this.touchActivity();
           return;
@@ -791,24 +815,56 @@ export class LlamaCpp implements LLM {
   }
 
   /**
+   * Wait for an in-progress idle unload before starting a model operation.
+   * A session acquired during unload blocks here while holding the session
+   * reference, so no second unload can begin before its operation starts.
+   */
+  async waitForIdleUnload(): Promise<void> {
+    if (this.idleUnloadPromise) {
+      await this.idleUnloadPromise;
+    }
+  }
+
+  /**
    * Unload idle resources but keep the instance alive for future use.
    *
    * By default, this disposes contexts (and their dependent sequences), while keeping models loaded.
    * This matches the intended lifecycle: model → context → sequence, where contexts are per-session.
    */
   async unloadIdleResources(): Promise<void> {
-    // Don't unload if already disposed
+    if (this.idleUnloadPromise) {
+      return this.idleUnloadPromise;
+    }
+
+    const unload = this.performIdleUnload();
+    this.idleUnloadPromise = unload;
+    try {
+      await unload;
+    } finally {
+      if (this.idleUnloadPromise === unload) {
+        this.idleUnloadPromise = null;
+      }
+    }
+  }
+
+  private async performIdleUnload(): Promise<void> {
     if (this.disposed) {
       return;
     }
 
-    // Clear timer
+    // Re-check after the timer callback enters the unload path. A session may
+    // have started after the timer fired but before this method acquired the
+    // instance's unload barrier.
+    if (!canUnloadLLM(this)) {
+      this.touchActivity();
+      return;
+    }
+
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;
     }
 
-    // Dispose contexts first
     for (const ctx of this.embedContexts) {
       await ctx.dispose();
     }
@@ -818,7 +874,6 @@ export class LlamaCpp implements LLM {
     }
     this.rerankContexts = [];
 
-    // Optionally dispose models too (opt-in)
     if (this.disposeModelsOnInactivity) {
       if (this.embedModel) {
         await this.embedModel.dispose();
@@ -832,13 +887,10 @@ export class LlamaCpp implements LLM {
         await this.rerankModel.dispose();
         this.rerankModel = null;
       }
-      // Reset load promises so models can be reloaded later
       this.embedModelLoadPromise = null;
       this.generateModelLoadPromise = null;
       this.rerankModelLoadPromise = null;
     }
-
-    // Note: We keep llama instance alive - it's lightweight
   }
 
   /**
@@ -1677,6 +1729,7 @@ export class LlamaCpp implements LLM {
   }
 
   async dispose(): Promise<void> {
+    await this.waitForIdleUnload();
     // Prevent double-dispose
     if (this.disposed) {
       return;
@@ -1905,19 +1958,18 @@ class LLMSession implements ILLMSession {
   }
 }
 
-// Session manager for the default LlamaCpp instance
+const sessionManagers = new WeakMap<LlamaCpp, LLMSessionManager>();
 let defaultSessionManager: LLMSessionManager | null = null;
 
-/**
- * Get the session manager for the default LlamaCpp instance.
- */
-function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
-    defaultSessionManager = new LLMSessionManager(llm);
-  }
-  return defaultSessionManager;
+function getSessionManagerForLlm(llm: LlamaCpp): LLMSessionManager {
+  const existing = sessionManagers.get(llm);
+  if (existing) return existing;
+
+  const manager = new LLMSessionManager(llm);
+  sessionManagers.set(llm, manager);
+  return manager;
 }
+
 
 /**
  * Execute a function with a scoped LLM session.
@@ -1937,10 +1989,13 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = getSessionManager();
+  const llm = getDefaultLlamaCpp();
+  const manager = getSessionManagerForLlm(llm);
+  defaultSessionManager = manager;
   const session = new LLMSession(manager, options);
 
   try {
+    await llm.waitForIdleUnload();
     return await fn(session);
   } finally {
     session.release();
@@ -1956,10 +2011,11 @@ export async function withLLMSessionForLlm<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = new LLMSessionManager(llm);
+  const manager = getSessionManagerForLlm(llm);
   const session = new LLMSession(manager, options);
 
   try {
+    await llm.waitForIdleUnload();
     return await fn(session);
   } finally {
     session.release();
@@ -1967,12 +2023,12 @@ export async function withLLMSessionForLlm<T>(
 }
 
 /**
- * Check if idle unload is safe (no active sessions or operations).
- * Used internally by LlamaCpp idle timer.
+ * Check if idle unload is safe for one LlamaCpp instance, or for the default
+ * singleton when no instance is supplied.
  */
-export function canUnloadLLM(): boolean {
-  if (!defaultSessionManager) return true;
-  return defaultSessionManager.canUnload();
+export function canUnloadLLM(llm?: LlamaCpp): boolean {
+  if (llm) return sessionManagers.get(llm)?.canUnload() ?? true;
+  return defaultSessionManager?.canUnload() ?? true;
 }
 
 // =============================================================================

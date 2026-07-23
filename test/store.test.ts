@@ -3212,6 +3212,7 @@ describe("Embedding batching", () => {
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
+      async waitForIdleUnload() {},
       async embed(text: string, options?: { model?: string }) {
         embedCalls.push({ text, options });
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
@@ -3262,6 +3263,7 @@ describe("Embedding batching", () => {
     // A slow embedder so the short session cap trips between document batches.
     const embedBatchCalls: string[][] = [];
     const slowLlm = {
+      async waitForIdleUnload() {},
       async embed() { return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }; },
       async embedBatch(texts: string[]) {
         embedBatchCalls.push([...texts]);
@@ -3382,6 +3384,7 @@ describe("Embedding batching", () => {
     const db = store.db;
     let embedCalls = 0;
     const fakeLlm = {
+      async waitForIdleUnload() {},
       async embed(_text: string, _options?: { model?: string }) {
         embedCalls++;
         return embedCalls === 1
@@ -3423,6 +3426,7 @@ describe("Embedding batching", () => {
     const store = await createTestStore();
     const db = store.db;
     const fakeLlm = {
+      async waitForIdleUnload() {},
       async embed(_text: string, _options?: { model?: string }) {
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
       },
